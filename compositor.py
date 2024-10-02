@@ -10,7 +10,12 @@ log_init(loglevel)
 
 from wlroots import ffi
 from wlroots.helper import build_compositor
-from wlroots.wlr_types import Cursor, DataDeviceManager, OutputLayout, Scene, Seat, XCursorManager, XdgShell, idle_notify_v1, InputDevice, Output, Keyboard, SceneNodeType, SceneSurface, SceneBuffer, Buffer
+from wlroots.wlr_types import Cursor, DataDeviceManager, OutputLayout, Scene, Seat, XCursorManager, XdgShell, InputDevice, Output, Keyboard, SceneNodeType, SceneSurface, SceneBuffer, Buffer
+
+from wlroots.wlr_types.idle_notify_v1 import IdleNotifierV1
+from wlroots.wlr_types.layer_shell_v1 import LayerShellV1, LayerSurfaceV1
+from wlroots.wlr_types.foreign_toplevel_management_v1 import ForeignToplevelManagerV1
+
 from wlroots.wlr_types.scene import SceneNode, SceneRect, SceneBuffer, SceneTree
 from wlroots.wlr_types.cursor import WarpMode
 from wlroots.wlr_types.input_device import ButtonState, InputDeviceType
@@ -20,7 +25,7 @@ from wlroots.wlr_types.seat import RequestSetSelectionEvent
 from wlroots.wlr_types.xdg_shell import XdgSurface, XdgSurfaceRole
 from wlroots.util.clock import Timespec
 
-from pywayland import ffi as pywayland_ffi, lib as pywayland_lib
+#from pywayland import ffi as pywayland_ffi, lib as pywayland_lib
 from pywayland.server import Display, Client, Listener
 from pywayland.protocol.wayland import WlKeyboard, WlSeat
 from xkbcommon import xkb
@@ -220,10 +225,15 @@ class Server:
 			self.scene = Scene()
 			self.scene.attach_output_layout(self.output_layout)
 			self.scene_tree = SceneHelper(self.scene.tree)
-			self.idle_notify = idle_notify_v1.IdleNotifierV1(self.display)
+			self.idle_notify = IdleNotifierV1(self.display)
+			self.layer_shell = LayerShellV1(self.display)
+			self.foreign_manager = ForeignToplevelManagerV1(self.display._ptr)
 			self.xkb_context = xkb.Context()
 			
+			print(self.layer_shell, dir(self.layer_shell))
+			
 			self.xdg_shell.new_surface_event.add(Listener(self.new_surface))
+			self.layer_shell.new_surface_event.add(Listener(self.new_surface_layer))
 			self.backend.new_input_event.add(Listener(self.new_input))
 			self.backend.new_output_event.add(Listener(self.new_output))
 			self.cursor.motion_event.add(Listener(self.cursor_motion))
@@ -242,9 +252,17 @@ class Server:
 			self.__exit__(None, None, None) # TODO: frame info
 			raise
 		
+		if __debug__:
+			for attr in self.__wl_objects:
+				obj = getattr(self, attr)
+				if attr in self.__managers:
+					assert hasattr(obj, '__enter__') and hasattr(obj, '__exit__'), attr
+				else:
+					assert not hasattr(obj, '__enter__') and not hasattr(obj, '__exit__'), attr
+		
 		return self
 	
-	__wl_objects = ['display', 'compositor', 'allocator', 'renderer', 'backend', 'subcompositor', 'device_manager', 'xdg_shell', 'output_layout', 'cursor', 'xcursor_manager', 'seat', 'scene', 'idle_notify', 'xkb_context', 'socket', 'event_loop']
+	__wl_objects = ['display', 'compositor', 'allocator', 'renderer', 'backend', 'subcompositor', 'device_manager', 'xdg_shell', 'output_layout', 'cursor', 'xcursor_manager', 'seat', 'scene', 'idle_notify', 'layer_shell', 'foreign_manager', 'xkb_context', 'socket', 'event_loop']
 	__managers = frozenset(['display', 'output_layout', 'cursor', 'xcursor_manager', 'seat', 'backend'])
 	
 	def __exit__(self, *args):
@@ -261,17 +279,28 @@ class Server:
 	def manager_notify(self, method, role, event, surface):
 		if self.manager_in is None: return
 		
-		print("manager_notify", method, role, event, hex(id(surface)))
-		self.manager_in.write(f"{self.notification_serial} {method} {role} {hex(id(surface))}\n".encode('utf-8'))
+		if role != 'OUTPUT':
+			id_ = id(surface.data)
+		else:
+			id_ = id(surface)
+		
+		print("manager_notify", self.notification_serial, method, role, hex(id(surface)), hex(id_))
+		self.manager_in.write(f"{self.notification_serial} {method} {role} {hex(id_)}\n".encode('utf-8'))
 		self.manager_in.flush()
 		self.notification_serial += 1
+	
+	def new_surface_layer(self, listener, surface:LayerSurfaceV1):
+		self.log.info(f"new wlr layer surface {surface}")
+		print(dir(surface))
+		for state in [surface.current, surface.pending]:
+			print("anchor:", *[_label for _label, _if in zip(['top', 'bottom', 'left', 'right'], [(state.anchor >> _n) & 1 for _n in range(4)]) if _if])
+			print("layer:", ['background', 'bottom', 'top', 'overlay'][state.layer])
+			print("actual size:", state.actual_width, state.actual_height, "desired size:", state.desired_width, state.desired_height)
 	
 	def new_surface(self, listener, surface:XdgSurface):
 		"New surface was created by a client; add it to scene graph and install event listeners."
 		
 		self.log.info(f"new xdg surface {surface.role.name}")
-		
-		self.surfaces[id(surface)] = surface
 		
 		#surface.configure
 		#surface.ack_configure
@@ -308,14 +337,20 @@ class Server:
 		else:
 			self.log.warning(f"unknown xdg surface role {surface.role.name}")
 		
-		if len(self.surfaces) > 1: # don't send notification for the very first window as it is the desktop
+		self.surfaces[id(surface.data)] = surface
+		
+		if len(self.surfaces) > 1: # don't send notification for the very first window because it is the desktop
 			self.manager_notify('new_surface', surface.role.name, None, surface)
 	
 	def surface_destroy(self, listener, event, surface:XdgSurface):
 		self.log.info(f"surface destroy {event} {surface}")
 		self.manager_notify('surface_destroy', surface.role.name, event, surface)
 		
-		del self.surfaces[id(surface)]
+		if self.pointed_surface and self.pointed_surface.is_xdg_surface and (XdgSurface.from_surface(self.pointed_surface).data is surface.data):
+			self.log.info("unset pointed surface")
+			self.pointed_surface = None
+		
+		del self.surfaces[id(surface.data)]
 		
 		if surface.data:
 			surface.data.destroy()
@@ -424,29 +459,61 @@ class Server:
 		node_x_y = self.scene.tree.node.node_at(self.cursor.x, self.cursor.y)
 		if node_x_y is not None:
 			node, x, y = node_x_y
-			#print(f"node under cursor: {node.type.name}")
+			#print(f"node under cursor: {node}")
 			
 			if node.type == SceneNodeType.BUFFER:
 				scene_buffer = SceneBuffer.from_node(node)
+				#print(f"scene buffer under cursor: {scene_buffer}")
 				if scene_buffer is not None:
 					scene_surface = SceneSurface.from_buffer(scene_buffer)
+					#print(f"scene surface under cursor: {scene_surface}")
 					if scene_surface is not None:
 						pointed_surface = scene_surface.surface
+						#print(f"pointed surface: {pointed_surface}")
+			
+			#print("nnn", dir(node), dir(scene_buffer), dir(scene_surface), dir(pointed_surface))
+			
+			#if pointed_surface.is_xdg_surface:
+			#	xdg_surface = XdgSurface.from_surface(pointed_surface)
+			#else:
+			#	xdg_surface = None
 			
 			#tree = node.parent
+			#print("trn", tree, tree.node, tree.node.data)
 			#while tree and tree.node.data is None: # go down the tree until a surface node is found, identified by non-null `data` field
 			#	tree = tree.node.parent
+			
 			#if tree:
 			#	pointed_scene_node = tree.node.data # scene node under pointer
+			#else:
+			#	pointed_scene_node = None
 
-			#print(f"surface under cursor: {pointed_surface}")
+			#print(f"scene node under cursor: {pointed_scene_node}")
 		
 		if pointed_surface == self.pointed_surface:
 			if pointed_surface:
 				self.seat.pointer_notify_motion(time_msec, x, y)
 		else:
+			#if self.pointed_surface:
+			#	self.seat.pointer_notify_leave(self.pointed_surface, x, y)
+			if self.pointed_surface and self.pointed_surface.is_xdg_surface:
+				#print("a", self.pointed_surface)
+				xdg_surface = XdgSurface.from_surface(self.pointed_surface)
+				if xdg_surface.role == XdgSurfaceRole.TOPLEVEL:
+					xdg_surface.set_activated(False)
+				self.manager_notify('deactivate', xdg_surface.role.name, None, xdg_surface)
+			
 			if pointed_surface:
+				#print("b")
+				#node.raise_to_top()
 				self.seat.pointer_notify_enter(pointed_surface, x, y)
+				if pointed_surface.is_xdg_surface:
+					xdg_surface = XdgSurface.from_surface(pointed_surface)
+					if xdg_surface.role == XdgSurfaceRole.TOPLEVEL:
+						xdg_surface.set_activated(True)
+					self.manager_notify('activate', xdg_surface.role.name, None, xdg_surface)
+				server.seat.keyboard_notify_enter(pointed_surface, server.keyboards[0])
+			
 			else:
 				self.seat.pointer_clear_focus()
 		
@@ -454,6 +521,7 @@ class Server:
 			self.xcursor_manager.set_cursor_image('left_ptr', self.cursor)
 		
 		self.pointed_surface = pointed_surface
+		#print("end")
 		
 		#if pointed_scene_node != self.pointed_scene_node:
 		#	if pointed_scene_node is None and self.pointed_scene_node is not None:
@@ -567,19 +635,19 @@ if __name__ == '__main__':
 					server.manager_in.write(f"@ {message_id}\n".encode('utf-8'))
 					server.manager_in.flush()
 				
-				case [message_id, 'focus', surface_id]:
-					try:
-						surface = server.surfaces[int(surface_id, 16)]
-					except KeyError:
-						return
-					surface.set_activated(True)
-					server.seat.keyboard_notify_enter(surface.surface, server.keyboards[0])
-					
-					for output in server.outputs.values():
-						output.commit()
-					
-					server.manager_in.write(f"@ {message_id}\n".encode('utf-8'))
-					server.manager_in.flush()
+				#case [message_id, 'focus', surface_id]:
+				#	try:
+				#		surface = server.surfaces[int(surface_id, 16)]
+				#	except KeyError:
+				#		return
+				#	surface.set_activated(True)
+				#	server.seat.keyboard_notify_enter(surface.surface, server.keyboards[0])
+				#	
+				#	for output in server.outputs.values():
+				#		output.commit()
+				#	
+				#	server.manager_in.write(f"@ {message_id}\n".encode('utf-8'))
+				#	server.manager_in.flush()
 				
 				case default:
 					print("default", default)
