@@ -50,26 +50,21 @@ class Desktop(BuilderExtension):
 	def add_toplevel(self, toplevel):
 		toplevel.desktop = self
 		self.toplevel_stack.add_named(toplevel, str(time()))
-		toplevel.show()
-		self.toplevel_stack.set_visible_child(toplevel)
 	
 	def remove_toplevel(self, toplevel):
-		toplevel.hide()
 		self.toplevel_stack.remove(toplevel)
 		try:
 			next_toplevel = self.toplevel_stack.get_children()[0]
 		except IndexError:
 			pass
 		else:
-			next_toplevel.show()
-			self.toplevel_stack.set_visible_child(next_toplevel)
+			self.activate_toplevel(next_toplevel)
 		self.toplevel_stack.queue_draw()
 	
 	def activate_toplevel(self, toplevel):
 		self.toplevel_stack.set_visible_child(toplevel)
 	
 	def deactivate_toplevel(self, toplevel):
-		#self.toplevel_stack.remove(toplevel)
 		pass
 
 
@@ -102,6 +97,12 @@ class Toplevel(Gtk.Widget, WaylandSurface):
 	def wayland_deactivate(self):
 		self.desktop.deactivate_toplevel(self)
 		print("toplevel deactivate", file=stderr)
+	
+	def wayland_map(self):
+		self.show()
+	
+	def wayland_unmap(self):
+		self.hide()
 
 
 class Popup(Gtk.Widget, WaylandSurface):
@@ -126,6 +127,11 @@ class Manager:
 	def new_output(self, id_):
 		self.outputs[id_] = Desktop(self.translation)
 		self.outputs[id_].window_main.show_all()
+	
+	def output_destroy(self, id_):
+		self.outputs[id_].window_main.hide()
+		self.outputs[id_].window_main.close()
+		#del self.outputs[id_] # FIXME: remove output after all surfaces have been removed
 	
 	def new_toplevel(self, id_):
 		toplevel = self.toplevels[id_] = Toplevel(id_)
@@ -168,6 +174,9 @@ if __name__ == '__main__':
 			case [msg_id, 'new_output', 'OUTPUT', output_id]:
 				manager.new_output(output_id)
 				message_out('@', msg_id)
+			case [msg_id, 'output_destroy', 'OUTPUT', output_id]:
+				manager.output_destroy(output_id)
+				message_out('@', msg_id)
 			
 			case [msg_id, 'new_surface', 'TOPLEVEL', surface_id]:
 				manager.new_toplevel(surface_id)
@@ -199,6 +208,10 @@ if __name__ == '__main__':
 						print("no method:", 'wayland_' + method_name, file=stderr)
 					else:
 						method()
+				message_out('@', msg_id)
+			
+			case [msg_id, 'quit', _, _]:
+				mainloop.quit()
 				message_out('@', msg_id)
 	
 	message_id = 0

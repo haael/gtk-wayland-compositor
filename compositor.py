@@ -15,6 +15,7 @@ from wlroots.wlr_types import Cursor, DataDeviceManager, OutputLayout, Scene, Se
 from wlroots.wlr_types.idle_notify_v1 import IdleNotifierV1
 from wlroots.wlr_types.layer_shell_v1 import LayerShellV1, LayerSurfaceV1
 from wlroots.wlr_types.foreign_toplevel_management_v1 import ForeignToplevelManagerV1
+from wlroots.wlr_types.xdg_decoration_v1 import XdgDecorationManagerV1, XdgToplevelDecorationV1
 
 from wlroots.wlr_types.scene import SceneNode, SceneRect, SceneBuffer, SceneTree
 from wlroots.wlr_types.cursor import WarpMode
@@ -25,7 +26,6 @@ from wlroots.wlr_types.seat import RequestSetSelectionEvent
 from wlroots.wlr_types.xdg_shell import XdgSurface, XdgSurfaceRole
 from wlroots.util.clock import Timespec
 
-#from pywayland import ffi as pywayland_ffi, lib as pywayland_lib
 from pywayland.server import Display, Client, Listener
 from pywayland.protocol.wayland import WlKeyboard, WlSeat
 from xkbcommon import xkb
@@ -187,7 +187,7 @@ class SceneHelper(WlList):
 		return self.__class__(Scene.xdg_surface_create(self.__item, surface))
 
 
-class Server:	
+class Server:
 	def __init__(self, log, cursor_size:int, seat_id:str):
 		log.info("Creating server: cursor_size={cursor_size}, seat_id={seat_id}")
 		self.log = log
@@ -213,6 +213,8 @@ class Server:
 	def __enter__(self):
 		"Create and initialize all session objects; install event listeners."
 		
+		self.log.info("Server context enter.")
+		
 		try:
 			self.display = Display().__enter__()
 			self.compositor, self.allocator, self.renderer, self.backend, self.subcompositor = build_compositor(self.display)
@@ -229,11 +231,13 @@ class Server:
 			self.layer_shell = LayerShellV1(self.display)
 			self.foreign_manager = ForeignToplevelManagerV1(self.display._ptr)
 			self.xkb_context = xkb.Context()
+			self.decoration_manager = XdgDecorationManagerV1(self.display._ptr)
 			
-			print(self.layer_shell, dir(self.layer_shell))
+			#print(self.decoration_manager, dir(self.decoration_manager))
 			
 			self.xdg_shell.new_surface_event.add(Listener(self.new_surface))
 			self.layer_shell.new_surface_event.add(Listener(self.new_surface_layer))
+			self.decoration_manager.new_toplevel_decoration_event.add(Listener(self.new_toplevel_decoration))
 			self.backend.new_input_event.add(Listener(self.new_input))
 			self.backend.new_output_event.add(Listener(self.new_output))
 			self.cursor.motion_event.add(Listener(self.cursor_motion))
@@ -248,8 +252,8 @@ class Server:
 			self.backend.__enter__()
 			self.event_loop = self.display.get_event_loop()
 		except Exception as error:
-			self.log.error(f"{type(error).__name__}: {str(error)}")
-			self.__exit__(None, None, None) # TODO: frame info
+			self.log.error("Error while constructing server.")
+			self.__exit__(type(error), error, None) # TODO: frame info
 			raise
 		
 		if __debug__:
@@ -260,31 +264,54 @@ class Server:
 				else:
 					assert not hasattr(obj, '__enter__') and not hasattr(obj, '__exit__'), attr
 		
+		self.log.info("Server context enter success.")
+		
 		return self
 	
-	__wl_objects = ['display', 'compositor', 'allocator', 'renderer', 'backend', 'subcompositor', 'device_manager', 'xdg_shell', 'output_layout', 'cursor', 'xcursor_manager', 'seat', 'scene', 'idle_notify', 'layer_shell', 'foreign_manager', 'xkb_context', 'socket', 'event_loop']
+	# objects are created in that order and destroyed in reverse order
+	__wl_objects = [
+		'display', 'compositor', 'allocator', 'renderer', 'backend', 'subcompositor', 'device_manager',
+		'xdg_shell', 'output_layout', 'cursor', 'xcursor_manager', 'seat', 'scene', 'idle_notify',
+		'layer_shell', 'foreign_manager', 'xkb_context', 'decoration_manager', 'socket', 'event_loop'
+	]
+	
+	# objects that support context manager protocol
 	__managers = frozenset(['display', 'output_layout', 'cursor', 'xcursor_manager', 'seat', 'backend'])
 	
-	def __exit__(self, *args):
+	def __exit__(self, exception_type, exception, traceback):
 		"Destroy all session objects, explicitly finalizing them if needed."
 		
+		self.log.info("Server context exit.")
+		
+		if exception:
+			self.log.error(str(exception))
+		
+		self.manager_in = self.manager_out = None
+		
 		for attr in reversed(self.__wl_objects):
-			if hasattr(self, attr):
-				if attr in self.__managers:
-					getattr(self, attr).__exit__(*args)
-				delattr(self, attr)
+			self.log.debug(f"delete {attr}")
+			try:
+				if hasattr(self, attr):
+					if attr in self.__managers:
+						getattr(self, attr).__exit__(None, None, None)
+					delattr(self, attr)
+			except Exception as error:
+				self.log.error(str(error))
 		
 		self.__reset()
+		
+		self.log.info("Server context exit success.")
 	
 	def manager_notify(self, method, role, event, surface):
-		if self.manager_in is None: return
+		if self.manager_in is None or self.display.destroyed:
+			return
 		
 		if role != 'OUTPUT':
 			id_ = id(surface.data)
 		else:
 			id_ = id(surface)
 		
-		print("manager_notify", self.notification_serial, method, role, hex(id(surface)), hex(id_))
+		print("manager_notify", self.notification_serial, method, role, hex(id(surface)), hex(id_), self.manager_in, self.display.destroyed)
 		self.manager_in.write(f"{self.notification_serial} {method} {role} {hex(id_)}\n".encode('utf-8'))
 		self.manager_in.flush()
 		self.notification_serial += 1
@@ -296,6 +323,10 @@ class Server:
 			print("anchor:", *[_label for _label, _if in zip(['top', 'bottom', 'left', 'right'], [(state.anchor >> _n) & 1 for _n in range(4)]) if _if])
 			print("layer:", ['background', 'bottom', 'top', 'overlay'][state.layer])
 			print("actual size:", state.actual_width, state.actual_height, "desired size:", state.desired_width, state.desired_height)
+	
+	def new_toplevel_decoration(self, listener, decoration:XdgToplevelDecorationV1):
+		self.log.info(f"new toplevel decoration {decoration}")
+		print(dir(decoration))
 	
 	def new_surface(self, listener, surface:XdgSurface):
 		"New surface was created by a client; add it to scene graph and install event listeners."
@@ -311,9 +342,10 @@ class Server:
 		surface.new_popup_event.add(Listener(lambda listener, event: self.manager_notify('new_popup', surface.role.name, event, surface)))
 		
 		if surface.role == XdgSurfaceRole.TOPLEVEL:
-			self.log.info(" toplevel")
-			
 			toplevel = surface.toplevel
+			
+			self.log.info(f" toplevel {toplevel.app_id} '{toplevel.title}' {toplevel.parent}")
+			
 			toplevel.request_move_event.add(Listener(lambda listener, event: self.manager_notify('move', 'TOPLEVEL', event, surface)))
 			toplevel.request_resize_event.add(Listener(lambda listener, event: self.manager_notify('resize', 'TOPLEVEL', event, surface)))
 			toplevel.request_maximize_event.add(Listener(lambda listener, event: self.manager_notify('maximize', 'TOPLEVEL', event, surface)))
@@ -327,9 +359,10 @@ class Server:
 			surface.data = self.scene_tree.append_surface(surface) # create scene node and assign to the `data` field
 		
 		elif surface.role == XdgSurfaceRole.POPUP:
+			popup = surface.popup
+			
 			self.log.info(" popup")
 			
-			popup = surface.popup
 			popup.reposition_event.add(Listener(lambda listener, event: self.manager_notify('reposition', 'POPUP', event, surface)))
 			
 			surface.data = XdgSurface.from_surface(popup.parent).data.append_surface(surface) # find parent, find scene node from parent's `data` field, create new scene node, assign to popup's `data` field
@@ -413,16 +446,27 @@ class Server:
 		
 		self.log.info(f"new output device")
 		
+		self.outputs[id(output)] = output
+		
+		output.destroy_event.add(Listener(lambda listener, _output: self.output_destroy(listener, output)))
+		output.frame_event.add(Listener(lambda listener, frame: self.output_frame(listener, frame, output)))
+		
 		output.init_render(self.allocator, self.renderer)
 		output.set_mode(output.preferred_mode())
 		output.enable()
 		output.commit()
-		self.output_layout.add_auto(output)
-		output.frame_event.add(Listener(lambda listener, frame: self.output_frame(listener, frame, output)))
-		
-		self.outputs[id(output)] = output
+		self.output_layout.add_auto(output)		
 		
 		self.manager_notify('new_output', 'OUTPUT', None, output)
+	
+	def output_destroy(self, listener, output):
+		self.log.info(f"destroy output")
+		
+		self.manager_notify('output_destroy', 'OUTPUT', None, output)
+		
+		del self.outputs[id(output)]
+		if not self.outputs: # last window closed
+			self.display.terminate()
 	
 	def output_frame(self, listener, frame, output):
 		"Render a single frame on the provided output device."
@@ -592,8 +636,6 @@ if __name__ == '__main__':
 		server.manager_out = manager.stdout
 		
 		def manager_request(msg):
-			print("manager_request", msg)
-
 			match msg.split():
 				case [message_id, 'map', surface_id]:
 					try:
@@ -650,8 +692,7 @@ if __name__ == '__main__':
 				#	server.manager_in.flush()
 				
 				case default:
-					print("default", default)
-			
+					print("default", default)	
 		
 		server.event_loop.add_fd(manager.stdout.fileno(), lambda _a, fd, _b: manager_request(manager.stdout.readline()[:-1].decode('utf-8')))
 		

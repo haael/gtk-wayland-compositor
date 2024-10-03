@@ -1,9 +1,11 @@
-# gtk-wayland-compositor
-Wayland compositor delegating window management to Gtk layout
+# gwayco
 
-Status: alpha
+Wayland compositor delegating window management to Gtk layout. Written with help of wlroots.
 
-Language: Python
+"Gwayco" stands for "Gtk Wayland compositor".
+
+Development status: alpha.
+
 
 # what?
 
@@ -15,7 +17,11 @@ The server then configures app windows to mimick geometry of the shadow widget.
 
 Making a tiling window manager is as simple as placing Gtk.Box in the root window.
 
-# try it?
+
+If window manager is not present, the compositor is expected to position windows using some built-in default.
+
+
+# try it
 
 You can try it from existing X11 or Wayland session. Make sure you have wlroots and Gtk installed together with Python bindings.
 
@@ -37,3 +43,4 @@ GDK_BACKEND=wayland WAYLAND_DISPLAY=wayland-0 ./hello.py two two two
 ```
 
 The new app window show should be added to a layout, making it a very simple tiling window manager.
+
