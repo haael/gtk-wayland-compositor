@@ -30,8 +30,12 @@ from pywayland.server import Display, Client, Listener
 from pywayland.protocol.wayland import WlKeyboard, WlSeat
 from xkbcommon import xkb
 
+from itertools import product
+
 
 class WlList:
+	"Direct access to WlList c-structure."
+	
 	def __init__(self, ptr, type, link, child_cls):
 		self.__ptr = ptr
 		self.__type = type
@@ -67,15 +71,17 @@ class WlList:
 		if l != index:
 			raise IndexError
 		
-		ptr = ffi.cast(self.__type + ' *', ffi.cast('void *', child) - ffi.offsetof(self.__type, self.__field))
+		ptr = ffi.cast(self.__type + ' *', ffi.cast('void *', child) - ffi.offsetof(self.__type, self.__link))
 		return self.__child_cls(ptr)
 
 
 class SceneHelper(WlList):
+	"Scene graph."
+	
 	def __init__(self, item: SceneTree | SceneRect | SceneBuffer):
 		self.__item = item
 		if self.type == SceneNodeType.TREE:
-			WlList.__init__(self, ffi.addressof(self.__item._ptr.children), 'struct wl_scene_node', 'link', self.__convert_child)
+			WlList.__init__(self, ffi.addressof(self.__item._ptr.children), 'struct wlr_scene_node', 'link', self.__convert_child)
 	
 	def get_item(self) -> SceneTree | SceneRect | SceneBuffer:
 		return self.__item
@@ -125,7 +131,7 @@ class SceneHelper(WlList):
 			props['width'] = self.width
 			props['height'] = self.height
 		
-		return self.__class__.__name__ + '(' + ', '.join(_key + '=' + repr(props[_key]) for _key in attrs) + ')'
+		return self.__class__.__name__ + '(' + ', '.join(_key + '=' + repr(props[_key]) for _key in attrs) + ')' + (f'[{len(self)}]' if self.type == SceneNodeType.TREE else '')
 	
 	def __dir__(self):
 		return list(frozenset().union(self.__dict__.keys(), dir(self.__item), dir(self.__item.node), dir(self.__item._ptr)))
@@ -187,6 +193,96 @@ class SceneHelper(WlList):
 		return self.__class__(Scene.xdg_surface_create(self.__item, surface))
 
 
+class DesktopManager:
+	class Record:
+		pass
+	
+	def __init__(self):
+		self.desktop = {}
+		self.windows = {}
+	
+	def create_desktop(self, output):
+		desktop = self.desktop[int(ffi.cast('uintptr_t', output._ptr))] = self.Record()
+		desktop.windows = {}
+		desktop.positions = {}
+		desktop.shown = {}
+		desktop.order = []
+		desktop.width = 0
+		desktop.height = 0
+		self.__reposition(desktop)
+		self.__commit(desktop)
+	
+	def destroy_desktop(self, output):
+		del self.desktop[int(ffi.cast('uintptr_t', output._ptr))]
+		for w_id in [w_id for w_id, d_id in self.windows.items() if d_id == int(ffi.cast('uintptr_t', output._ptr))]:
+			del self.windows[w_id]
+	
+	def resize_desktop(self, output, w, h):
+		desktop = self.desktop[int(ffi.cast('uintptr_t', output._ptr))]
+		desktop.width = w
+		desktop.height = h
+		self.__reposition(desktop)
+		self.__commit(desktop)
+	
+	def create_window(self, output, surface):
+		print("create_window", surface.toplevel.app_id, surface.toplevel.title, surface.toplevel.parent)
+		self.windows[id(surface)] = int(ffi.cast('uintptr_t', output._ptr))
+		desktop = self.desktop[int(ffi.cast('uintptr_t', output._ptr))]
+		desktop.order.append(id(surface))
+		desktop.windows[id(surface)] = surface
+		desktop.shown[id(surface)] = False
+		self.__reposition(desktop)
+		self.__commit(desktop)
+	
+	def destroy_window(self, surface):
+		desktop = self.desktop[self.windows[id(surface)]]
+		desktop.order.remove(id(surface))
+		del desktop.windows[id(surface)]
+		del desktop.positions[id(surface)]
+		del desktop.shown[id(surface)]
+		self.__reposition(desktop)
+		self.__commit(desktop)
+	
+	def update_window(self, surface):
+		print("update_window", surface.toplevel.app_id, surface.toplevel.title, surface.toplevel.parent)
+		desktop = self.desktop[self.windows[id(surface)]]
+		self.__reposition(desktop)
+		self.__commit(desktop)
+	
+	def map_window(self, surface):
+		desktop = self.desktop[self.windows[id(surface)]]
+		desktop.shown[id(surface)] = True
+		self.__reposition(desktop)
+		self.__commit(desktop)
+	
+	def unmap_window(self, surface):
+		desktop = self.desktop[self.windows[id(surface)]]
+		desktop.shown[id(surface)] = False
+		self.__reposition(desktop)
+		self.__commit(desktop)
+	
+	def __reposition(self, desktop):
+		assert isinstance(desktop, self.Record)
+		desktop.order.sort(key=lambda _id: str(desktop.windows[_id].toplevel.app_id))
+		order = [_v for _v in desktop.order if desktop.shown[_v]]
+		max_columns = 4
+		rows = (len(order) - 1) // max_columns + 1
+		columns = min(len(order), max_columns)
+		
+		for id_, (j, i) in zip(order, product(range(rows), range(columns))):
+			print(id_, (i, j), '/', (columns, rows))
+			desktop.positions[id_] = int(i * desktop.width / columns), int(j * desktop.height / rows), int(desktop.width / columns), int(desktop.height / rows)
+	
+	def __commit(self, desktop):
+		assert isinstance(desktop, self.Record)
+		order = [_v for _v in desktop.order if desktop.shown[_v]]
+		for id_ in order:
+			surface = desktop.windows[id_]
+			x, y, w, h = desktop.positions[id_]
+			surface.data.set_position(x, y)
+			surface.set_size(w, h)
+
+
 class Server:
 	def __init__(self, log, cursor_size:int, seat_id:str):
 		log.info("Creating server: cursor_size={cursor_size}, seat_id={seat_id}")
@@ -209,6 +305,8 @@ class Server:
 		self.keyboards = []
 		self.surfaces = {}
 		self.outputs = {}
+		self.output_background = {}
+		self.default_background_color = 0, 0, 0.4, 1
 	
 	def __enter__(self):
 		"Create and initialize all session objects; install event listeners."
@@ -220,20 +318,21 @@ class Server:
 			self.compositor, self.allocator, self.renderer, self.backend, self.subcompositor = build_compositor(self.display)
 			self.device_manager = DataDeviceManager(self.display)
 			self.xdg_shell = XdgShell(self.display)
+			self.desktop_manager = DesktopManager()
 			self.output_layout = OutputLayout().__enter__()
 			self.cursor = Cursor(self.output_layout).__enter__()
-			self.xcursor_manager = XCursorManager(self.cursor_size).__enter__()
+			self.xcursor_manager = XCursorManager(None, self.cursor_size).__enter__()
 			self.seat = Seat(self.display, self.seat_id).__enter__()
+			
 			self.scene = Scene()
 			self.scene.attach_output_layout(self.output_layout)
 			self.scene_tree = SceneHelper(self.scene.tree)
+			
 			self.idle_notify = IdleNotifierV1(self.display)
-			self.layer_shell = LayerShellV1(self.display)
+			self.layer_shell = LayerShellV1(self.display, 1)
 			self.foreign_manager = ForeignToplevelManagerV1(self.display._ptr)
 			self.xkb_context = xkb.Context()
 			self.decoration_manager = XdgDecorationManagerV1(self.display._ptr)
-			
-			#print(self.decoration_manager, dir(self.decoration_manager))
 			
 			self.xdg_shell.new_surface_event.add(Listener(self.new_surface))
 			self.layer_shell.new_surface_event.add(Listener(self.new_surface_layer))
@@ -271,7 +370,7 @@ class Server:
 	# objects are created in that order and destroyed in reverse order
 	__wl_objects = [
 		'display', 'compositor', 'allocator', 'renderer', 'backend', 'subcompositor', 'device_manager',
-		'xdg_shell', 'output_layout', 'cursor', 'xcursor_manager', 'seat', 'scene', 'idle_notify',
+		'xdg_shell', 'desktop_manager', 'output_layout', 'cursor', 'xcursor_manager', 'seat', 'scene', 'idle_notify',
 		'layer_shell', 'foreign_manager', 'xkb_context', 'decoration_manager', 'socket', 'event_loop'
 	]
 	
@@ -302,20 +401,6 @@ class Server:
 		
 		self.log.info("Server context exit success.")
 	
-	def manager_notify(self, method, role, event, surface):
-		if self.manager_in is None or self.display.destroyed:
-			return
-		
-		if role != 'OUTPUT':
-			id_ = id(surface.data)
-		else:
-			id_ = id(surface)
-		
-		print("manager_notify", self.notification_serial, method, role, hex(id(surface)), hex(id_), self.manager_in, self.display.destroyed)
-		self.manager_in.write(f"{self.notification_serial} {method} {role} {hex(id_)}\n".encode('utf-8'))
-		self.manager_in.flush()
-		self.notification_serial += 1
-	
 	def new_surface_layer(self, listener, surface:LayerSurfaceV1):
 		self.log.info(f"new wlr layer surface {surface}")
 		print(dir(surface))
@@ -333,37 +418,40 @@ class Server:
 		
 		self.log.info(f"new xdg surface {surface.role.name}")
 		
-		#surface.configure
-		#surface.ack_configure
-		
 		surface.destroy_event.add(Listener(lambda listener, event: self.surface_destroy(listener, event, surface)))
 		surface.map_event.add(Listener(lambda listener, event: self.surface_map(listener, event, surface)))
-		surface.unmap_event.add(Listener(lambda listener, event: self.manager_notify('unmap', surface.role.name, event, surface)))
-		surface.new_popup_event.add(Listener(lambda listener, event: self.manager_notify('new_popup', surface.role.name, event, surface)))
+		surface.unmap_event.add(Listener(lambda listener, event: self.desktop_manager.unmap_window(surface) if surface.role == XdgSurfaceRole.TOPLEVEL else None))
+		#surface.new_popup_event.add(Listener(lambda listener, event: self.surface_new_popup(listener, event, surface)))
+		#surface.configure_event.add(Listener(lambda listener, event: self.surface_configure(listener, event, surface)))
+		#surface.ack_configure_event.add(Listener(lambda listener, event: self.surface_ack_configure(listener, event, surface)))
 		
 		if surface.role == XdgSurfaceRole.TOPLEVEL:
 			toplevel = surface.toplevel
 			
-			self.log.info(f" toplevel {toplevel.app_id} '{toplevel.title}' {toplevel.parent}")
+			self.log.info(f" toplevel id='{toplevel.app_id}' title='{toplevel.title}' parent={toplevel.parent}")
 			
-			toplevel.request_move_event.add(Listener(lambda listener, event: self.manager_notify('move', 'TOPLEVEL', event, surface)))
-			toplevel.request_resize_event.add(Listener(lambda listener, event: self.manager_notify('resize', 'TOPLEVEL', event, surface)))
-			toplevel.request_maximize_event.add(Listener(lambda listener, event: self.manager_notify('maximize', 'TOPLEVEL', event, surface)))
-			toplevel.request_minimize_event.add(Listener(lambda listener, event: self.manager_notify('minimize', 'TOPLEVEL', event, surface)))
-			toplevel.request_fullscreen_event.add(Listener(lambda listener, event: self.manager_notify('fullscreen', 'TOPLEVEL', event, surface)))
-			toplevel.request_show_window_menu_event.add(Listener(lambda listener, event: self.manager_notify('show_window_menu', 'TOPLEVEL', event, surface)))
-			toplevel.set_parent_event.add(Listener(lambda listener, event: self.manager_notify('set_parent', 'TOPLEVEL', event, surface)))
-			toplevel.set_title_event.add(Listener(lambda listener, event: self.manager_notify('set_title', 'TOPLEVEL', event, surface)))
-			toplevel.set_app_id_event.add(Listener(lambda listener, event: self.manager_notify('set_app_id', 'TOPLEVEL', event, surface)))
+			#toplevel.request_move_event.add(Listener(lambda listener, event: self.manager_notify('move', 'TOPLEVEL', event, surface)))
+			#toplevel.request_resize_event.add(Listener(lambda listener, event: self.manager_notify('resize', 'TOPLEVEL', event, surface)))
+			#toplevel.request_maximize_event.add(Listener(lambda listener, event: self.manager_notify('maximize', 'TOPLEVEL', event, surface)))
+			#toplevel.request_minimize_event.add(Listener(lambda listener, event: self.manager_notify('minimize', 'TOPLEVEL', event, surface)))
+			#toplevel.request_fullscreen_event.add(Listener(lambda listener, event: self.manager_notify('fullscreen', 'TOPLEVEL', event, surface)))
+			#toplevel.request_show_window_menu_event.add(Listener(lambda listener, event: self.manager_notify('show_window_menu', 'TOPLEVEL', event, surface)))
+			toplevel.set_parent_event.add(Listener(lambda listener, event: self.toplevel_update(listener, event, surface)))
+			toplevel.set_title_event.add(Listener(lambda listener, event: self.toplevel_update(listener, event, surface)))
+			toplevel.set_app_id_event.add(Listener(lambda listener, event: self.toplevel_update(listener, event, surface)))
 			
-			surface.data = self.scene_tree.append_surface(surface) # create scene node and assign to the `data` field
+			output = list(self.outputs.values())[0] # TODO: select output
+			surface.data = self.output_background[int(ffi.cast('uintptr_t', output._ptr))][1].append_surface(surface) # create scene node and assign to the `data` field
+			
+			if surface.toplevel.app_id not in self.desktop_manager.desktop:
+				self.desktop_manager.create_window(output, surface)
 		
 		elif surface.role == XdgSurfaceRole.POPUP:
 			popup = surface.popup
 			
 			self.log.info(" popup")
 			
-			popup.reposition_event.add(Listener(lambda listener, event: self.manager_notify('reposition', 'POPUP', event, surface)))
+			#popup.reposition_event.add(Listener(lambda listener, event: self.manager_notify('reposition', 'POPUP', event, surface)))
 			
 			surface.data = XdgSurface.from_surface(popup.parent).data.append_surface(surface) # find parent, find scene node from parent's `data` field, create new scene node, assign to popup's `data` field
 		
@@ -371,13 +459,12 @@ class Server:
 			self.log.warning(f"unknown xdg surface role {surface.role.name}")
 		
 		self.surfaces[id(surface.data)] = surface
-		
-		if len(self.surfaces) > 1: # don't send notification for the very first window because it is the desktop
-			self.manager_notify('new_surface', surface.role.name, None, surface)
 	
 	def surface_destroy(self, listener, event, surface:XdgSurface):
 		self.log.info(f"surface destroy {event} {surface}")
-		self.manager_notify('surface_destroy', surface.role.name, event, surface)
+		
+		if surface.role == XdgSurfaceRole.TOPLEVEL:
+			self.desktop_manager.destroy_window(surface)
 		
 		if self.pointed_surface and self.pointed_surface.is_xdg_surface and (XdgSurface.from_surface(self.pointed_surface).data is surface.data):
 			self.log.info("unset pointed surface")
@@ -391,20 +478,20 @@ class Server:
 	def surface_map(self, listener, event, surface:XdgSurface):
 		self.log.info(f"surface map {event} {surface}")
 		
-		if len(self.surfaces) > 1:
-			self.manager_notify('map', surface.role.name, event, surface)
-			return
+		if surface.role == XdgSurfaceRole.TOPLEVEL:
+			self.desktop_manager.map_window(surface)
 		
-		# If len(self.surfaces) == 1 this is the desktop window. Maximize it.
-		surface.set_size(*list(self.outputs.values())[0].effective_resolution()) # maximize window
-		surface.set_maximized(True)
-		surface.data.set_position(0, 0)
-		surface.data.raise_to_top()
-		surface.set_activated(True)
 		self.seat.keyboard_notify_enter(surface.surface, self.keyboards[0])
 		
 		for output in server.outputs.values():
 			output.commit()
+	
+	def toplevel_update(self, listener, event, surface):
+		print("toplevel update")
+		if surface.toplevel.app_id in self.desktop_manager.desktop and surface in self.desktop_manager.windows.values():
+			self.desktop_manager.destroy_window(surface)
+		else:
+			self.desktop_manager.update_window(surface)
 	
 	def new_input(self, listener, input_device:InputDevice):
 		"New input device (like keyboard or mouse) was attached to the seat."
@@ -444,39 +531,121 @@ class Server:
 	def new_output(self, listener, output:Output):
 		"New output device (like a monitor or offscreen buffer) was added to the display."
 		
-		self.log.info(f"new output device")
+		self.log.info(f"new output device {output.name}")
 		
-		self.outputs[id(output)] = output
+		self.outputs[int(ffi.cast('uintptr_t', output._ptr))] = output
 		
 		output.destroy_event.add(Listener(lambda listener, _output: self.output_destroy(listener, output)))
 		output.frame_event.add(Listener(lambda listener, frame: self.output_frame(listener, frame, output)))
+		output.request_state_event.add(Listener(lambda listener, event: self.output_request_state(listener, event)))
+		#output.bind_event.add(Listener(lambda listener, *args: self.output_bind(listener, *args, output)))
+		#output.damage_event.add(Listener(lambda listener, *args: self.output_damage(listener, *args, output)))
+		#output.description_event.add(Listener(lambda listener, *args: self.output_description(listener, *args, output)))
+		#output.enable_event.add(Listener(lambda listener, *args: self.output_enable(listener, *args, output)))
+		#output.needs_frame_event.add(Listener(lambda listener, *args: self.output_needs_frame(listener, *args, output)))
+		#output.precommit_event.add(Listener(lambda listener, *args: self.output_precommit(listener, *args, output)))
+		#output.commit_event.add(Listener(lambda listener, *args: self.output_commit(listener, *args, output)))
+		#output.present_event.add(Listener(lambda listener, *args: self.output_present(listener, *args, output)))
 		
 		output.init_render(self.allocator, self.renderer)
-		output.set_mode(output.preferred_mode())
-		output.enable()
-		output.commit()
-		self.output_layout.add_auto(output)		
+		if (mode := output.preferred_mode()) is not None:
+			output.set_mode(mode)
+		self.output_layout.add_auto(output)
 		
-		self.manager_notify('new_output', 'OUTPUT', None, output)
+		#for _attr in dir(output):
+		#	if _attr.startswith('_'): continue
+		#	self.log.debug(f" {_attr}: {getattr(output, _attr)}")
+
+		# create default background
+		#box = self.output_layout.get_box(output)
+		
+		#width = 1024
+		#height = 768
+		
+		background = self.scene_tree.append_tree(0, 0)
+		#background.append_rect(0, 0, width, height, self.default_background_color)
+		#background.append_tree(0, 0)
+		self.output_background[int(ffi.cast('uintptr_t', output._ptr))] = background
+		
+		output.enable()
+		#output.commit()
+		
+		self.desktop_manager.create_desktop(output)
 	
 	def output_destroy(self, listener, output):
 		self.log.info(f"destroy output")
 		
-		self.manager_notify('output_destroy', 'OUTPUT', None, output)
+		try:
+			self.desktop_manager.destroy_desktop(output)
+		except AttributeError:
+			pass
 		
-		del self.outputs[id(output)]
+		try:
+			self.output_background[int(ffi.cast('uintptr_t', output._ptr))].destroy()
+		except KeyError:
+			pass
+		else:
+			del self.output_background[int(ffi.cast('uintptr_t', output._ptr))]
+		
+		del self.outputs[int(ffi.cast('uintptr_t', output._ptr))]
 		if not self.outputs: # last window closed
 			self.display.terminate()
 	
 	def output_frame(self, listener, frame, output):
 		"Render a single frame on the provided output device."
 		
-		#self.log.info("frame")
-		#self.log.debug(f" frame {frame} {output}")
+		#self.log.debug(f"output.frame {frame} {output}")
 		scene_output = self.scene.get_scene_output(output)
-		#self.log.debug(f" scene_output = {scene_output}")
-		scene_output.commit()
-		scene_output.send_frame_done(Timespec.get_monotonic_time())
+		if scene_output._ptr:
+			scene_output.commit()
+			scene_output.send_frame_done(Timespec.get_monotonic_time())
+	
+	def output_request_state(self, listener, event):
+		self.log.debug(f"output.mode {event.state.custom_mode}")
+		
+		output = event.output
+		state = event.state
+		#for _attr in dir(state):
+		#	if _attr.startswith('_'): continue
+		#	self.log.debug(f" {_attr}: {getattr(state, _attr)}")
+		
+		width = state.custom_mode.width
+		height = state.custom_mode.height
+		
+		try:
+			background = self.output_background[int(ffi.cast('uintptr_t', output._ptr))]
+		except KeyError:
+			background = self.scene_tree.append_tree(0, 0)
+			background.append_rect(0, 0, width, height, self.default_background_color)
+		else:
+			background.set_position(0, 0)
+			background[0].set_size(width, height)
+		
+		self.desktop_manager.resize_desktop(output, width, height)
+	
+	#def output_bind(self, listener, arg, output):
+	#	self.log.debug(f"output.bind {arg} {output}")
+	#
+	#def output_damage(self, listener, damaged, output):
+	#	self.log.debug(f"output.damage {damaged} {output}")
+	#
+	#def output_description(self, listener, arg, output):
+	#	self.log.debug(f"output.description {arg} {output}")
+	#
+	#def output_enable(self, listener, arg, output):
+	#	self.log.debug(f"output.enable {arg} {output}")
+	#
+	#def output_needs_frame(self, listener, arg, output):
+	#	self.log.debug(f"output.needs_frame {arg} {output}")
+	#
+	#def output_precommit(self, listener, arg, output):
+	#	self.log.debug(f"output.precommit {arg} {output}")
+	#
+	#def output_commit(self, listener, arg, output):
+	#	self.log.debug(f"output.commit {arg} {output}")
+	#
+	#def output_present(self, listener, arg, output):
+	#	self.log.debug(f"output.present {arg} {output}")
 	
 	def cursor_motion(self, listener, event_motion:PointerMotionEvent):
 		"Relative cursor motion event. Argument contains `delta_x` and `delta_y` fields."
@@ -503,79 +672,49 @@ class Server:
 		node_x_y = self.scene.tree.node.node_at(self.cursor.x, self.cursor.y)
 		if node_x_y is not None:
 			node, x, y = node_x_y
-			#print(f"node under cursor: {node}")
 			
 			if node.type == SceneNodeType.BUFFER:
 				scene_buffer = SceneBuffer.from_node(node)
-				#print(f"scene buffer under cursor: {scene_buffer}")
 				if scene_buffer is not None:
 					scene_surface = SceneSurface.from_buffer(scene_buffer)
-					#print(f"scene surface under cursor: {scene_surface}")
 					if scene_surface is not None:
 						pointed_surface = scene_surface.surface
-						#print(f"pointed surface: {pointed_surface}")
-			
-			#print("nnn", dir(node), dir(scene_buffer), dir(scene_surface), dir(pointed_surface))
-			
-			#if pointed_surface.is_xdg_surface:
-			#	xdg_surface = XdgSurface.from_surface(pointed_surface)
-			#else:
-			#	xdg_surface = None
-			
-			#tree = node.parent
-			#print("trn", tree, tree.node, tree.node.data)
-			#while tree and tree.node.data is None: # go down the tree until a surface node is found, identified by non-null `data` field
-			#	tree = tree.node.parent
-			
-			#if tree:
-			#	pointed_scene_node = tree.node.data # scene node under pointer
-			#else:
-			#	pointed_scene_node = None
-
-			#print(f"scene node under cursor: {pointed_scene_node}")
 		
 		if pointed_surface == self.pointed_surface:
 			if pointed_surface:
 				self.seat.pointer_notify_motion(time_msec, x, y)
 		else:
-			#if self.pointed_surface:
-			#	self.seat.pointer_notify_leave(self.pointed_surface, x, y)
 			if self.pointed_surface and self.pointed_surface.is_xdg_surface:
-				#print("a", self.pointed_surface)
 				xdg_surface = XdgSurface.from_surface(self.pointed_surface)
 				if xdg_surface.role == XdgSurfaceRole.TOPLEVEL:
+					#xdg_surface.data.raise_to_top()
 					xdg_surface.set_activated(False)
-				self.manager_notify('deactivate', xdg_surface.role.name, None, xdg_surface)
+					#self.desktop_manager.deactivate()
+				#self.manager_notify('deactivate', xdg_surface.role.name, None, xdg_surface)
 			
 			if pointed_surface:
-				#print("b")
-				#node.raise_to_top()
 				self.seat.pointer_notify_enter(pointed_surface, x, y)
 				if pointed_surface.is_xdg_surface:
 					xdg_surface = XdgSurface.from_surface(pointed_surface)
 					if xdg_surface.role == XdgSurfaceRole.TOPLEVEL:
+						xdg_surface.data.raise_to_top()
 						xdg_surface.set_activated(True)
-					self.manager_notify('activate', xdg_surface.role.name, None, xdg_surface)
+					#self.manager_notify('activate', xdg_surface.role.name, None, xdg_surface)
 				server.seat.keyboard_notify_enter(pointed_surface, server.keyboards[0])
 			
 			else:
 				self.seat.pointer_clear_focus()
 		
 		if not pointed_surface:
-			self.xcursor_manager.set_cursor_image('left_ptr', self.cursor)
+			self.xcursor_manager.load(1.0)
 		
 		self.pointed_surface = pointed_surface
-		#print("end")
-		
-		#if pointed_scene_node != self.pointed_scene_node:
-		#	if pointed_scene_node is None and self.pointed_scene_node is not None:
-		#		self.xcursor_manager.set_cursor_image('left_ptr', self.cursor)
-		#	self.pointed_scene_node = pointed_scene_node
 	
 	def cursor_button(self, listener, event:PointerButtonEvent):
 		self.seat.pointer_notify_button(event.time_msec, event.button, event.button_state)
 		self.log.debug(f"cursor button event: {self.cursor.x}, {self.cursor.y}, {event.button}, {event.button_state}")
 		self.idle_notify.notify_activity(self.seat)
+		self.log.debug("(end)")
 	
 	def cursor_axis(self, listener, event):
 		self.seat.pointer_notify_axis(event.time_msec, event.orientation, event.delta, event.delta_discrete, event.source)
@@ -591,7 +730,7 @@ class Server:
 	
 	def keyboard_key(self, listener, key_event:KeyboardKeyEvent, keyboard:Keyboard):
 		if not hasattr(self, 'idle_notify'):
-			"If the compositor has been closed using key combination, abort sequence, as the key release events would be triggered on finished object."
+			"If the compositor has been closed using key combination, abort sequence; else the key release events would be triggered on finished object."
 			listener.remove()
 			return
 		self.log.debug(f"keyboard key {key_event} {keyboard}")
@@ -629,6 +768,7 @@ if __name__ == '__main__':
 		environ['WAYLAND_DISPLAY'] = server.socket.decode()
 		server.log.info(f"socket {server.socket.decode()}")
 		
+		'''
 		manager = Popen(*desktop, stdin=PIPE, stdout=PIPE, shell=True, env=environ)
 		server.event_loop.add_signal(signal.SIGCHLD, lambda signum, _: server.display.terminate() if manager.poll() is not None else None)
 		
@@ -695,14 +835,18 @@ if __name__ == '__main__':
 					print("default", default)	
 		
 		server.event_loop.add_fd(manager.stdout.fileno(), lambda _a, fd, _b: manager_request(manager.stdout.readline()[:-1].decode('utf-8')))
+		'''
 		
-		for output in server.outputs.values():
-			server.manager_notify('new_output', 'OUTPUT', None, output)
+		#for output in server.outputs.values():
+		#	box = output.get_box()
+		#	server.desktop_manager.create_desktop(output, box.width, box.height)
+		#	#server.manager_notify('new_output', 'OUTPUT', None, output)
 		
 		server.display.run()
 		
-		manager.terminate()
+		#manager.terminate()
 		
-		server.log.info("bye")
-
+		server.log.info("server finished")
+	
+	logging.info("bye")
 
