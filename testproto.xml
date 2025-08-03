@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="gwayco">
+  <copyright>
+    Copyright © 2025 haael
+    Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+    The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <interface name="manager" version="1">
+    <description summary="layout manager interface">
+      This global interface represents a layout manager, which is responsible for managing window positioning.
+    </description>
+
+    <request name="register_">
+      <description summary="register as layout manager">
+        Register the client as a layout manager. The server will send layout manager events to this client.
+      </description>
+      <arg name="name" type="string" summary="client-decided name of layout manager: brand, version, pid"/>
+    </request>
+
+    <request name="unregister">
+      <description summary="unregister the layout manager">
+        Unregister the client from layout manager protocol.
+      </description>
+    </request>
+
+    <event name="surface">
+      <description summary="new surface">
+        A new surface appeared on the server. The server notifies the registered client. The client should create an info object that will be used to query information about the surface.
+      </description>
+      <arg name="surface" type="object" interface="surface" summary="surface object"/>
+    </event>
+
+    <request name="info">
+      <description summary="information about a surface">
+        Get/set information about the surface in layout manager protocol.
+      </description>
+      <arg name="id" type="new_id" interface="info" summary="ID of the new info object"/>
+      <arg name="surface" type="object" interface="surface" summary="surface object"/>
+    </request>
+
+    <event name="new_layout">
+      <description summary="create new layout">
+       The server asks the client to create a new layout. The client should respond by creating a new surface with 'layout' role and name set to the provided one.
+      </description>
+      <arg name="id" type="new_id" interface="layout" summary="ID of the new layout"/>
+      <arg name="name" type="string" summary="server-decided name of the layout surface"/>
+    </event>
+  </interface>
+
+  <interface name="info" version="1">
+    <description summary="surface info object">
+      An object associated with a surface that exchanges information related to the layout protocol between server and client.
+    </description>
+
+    <request name="destroy">
+      <description summary="delete the surface">
+       The client informs the server that the info object was destroyed.
+      </description>
+    </request>
+
+    <event name="deleted">
+      <description summary="delete the surface">
+       The server informs the client that the surface was deleted. Querying information from it is an error from now on. The client should destroy the info object.
+      </description>
+    </event>
+
+    <request name="role">
+      <description summary="">
+       The client assigns role to the surface. If the role is 'layout' it also sets name. For other roles name is irrelevant.
+      </description>
+      <arg name="role" type="enum" summary="role of the surface"/>
+      <arg name="name" type="string" summary="name"/>
+    </request>
+  </interface>
+
+  <interface name="layout" version="1">
+    <request name="destroy">
+      <description summary="destroy the layout">
+       The client informs the server that the layout was destroyed. All windows on it become unmanaged.
+      </description>
+    </request>
+
+    <event name="deleted">
+      <description summary="delete the layout">
+       The server informs the client that the layout was deleted. The client should free all resources, destroy its surface and destroy the object itself.
+      </description>
+    </event>
+
+    <event name="new_window">
+      <description summary="create new window">
+        The server informs the client that a new window appears on this layout. The client should allocate space for it on the layout and ask to show it.
+      </description>
+      <arg name="id" type="new_id" interface="window" summary="ID of the window"/>
+      <arg name="name" type="string" summary="server-decided name of the window for client's information"/>
+    </event>
+  </interface>
+
+  <interface name="window" version="1">
+    <request name="destroy">
+      <description summary="destroy the window">
+       The client informs the server that it no longer manages this window.
+      </description>
+    </request>
+
+    <event name="deleted">
+      <description summary="delete the window">
+       The server informs the client that the window was deleted. The client should remove it from the layout and destroy it.
+      </description>
+    </event>
+
+    <request name="show">
+      <description summary="show the window">
+       The client asks the server to map (show) the window.
+      </description>
+    </request>
+
+    <request name="hide">
+      <description summary="hide the window">
+       The client asks the server to unmap (hide) the window.
+      </description>
+    </request>
+
+    <request name="z_index">
+      <description summary="set z-index">
+       The client asks the server to reorder the windows so that windows with greater z-index are shown above those with the lower.
+      </description>
+      <arg name="z" type="float" summary="the z-index of the window"/>
+    </request>
+
+    <request name="focus">
+      <description summary="focus the window">
+       The client asks the server to activate the window and deactivate the previously activated window. Also give the window keyboard focus.
+      </description>
+    </request>
+
+    <request name="geometry">
+      <description summary="set the window's geometry">
+        The client asks the server to set the window's geometry (position and size).
+      </description>
+      <arg name="x" type="int" summary="the x coordinate of the window"/>
+      <arg name="y" type="int" summary="the y coordinate of the window"/>
+      <arg name="w" type="int" summary="the width of the window"/>
+      <arg name="h" type="int" summary="the height of the window"/>
+    </request>
+  </interface>
+</protocol>

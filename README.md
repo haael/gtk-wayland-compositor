@@ -27,20 +27,6 @@ You can try it from existing X11 or Wayland session. Make sure you have wlroots 
 
 From the project's directory run:
 
-`./compositor.py seat0 ./desktop.py`
+`./gwayco.py ./hello.py hello, void`
 
-Make sure to use the correct "seat" which is `seat0` for most people.
-
-A window should appear, with the Glade layout as chosen by `desktop.py`.
-Find the name of Wayland socket in the logs, which should be `wayland-0` if you are running under X11 or `wayland-1` if from inside other Wayland session.
-
-Then try connecting some desktop apps to the server.
-You may use the provided `hello.py` that accepts arguments and displays them as a label.
-
-```
-GDK_BACKEND=wayland WAYLAND_DISPLAY=wayland-0 ./hello.py one one one
-GDK_BACKEND=wayland WAYLAND_DISPLAY=wayland-0 ./hello.py two two two
-```
-
-The new app window show should be added to a layout, making it a very simple tiling window manager.
 

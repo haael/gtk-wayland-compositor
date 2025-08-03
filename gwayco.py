@@ -2,9 +2,9 @@
 
 
 __author__ = "haael"
-__copyright__ = "Copyright 2025, haael"
-__license__ = "GPLv3"
-__version__ = "0.0"
+__copyright__ = "Copyright © 2024-2025 haael"
+__license__ = "MIT"
+__version__ = "2025.08.02.22541aa"
 __status__ = "α"
 
 
@@ -13,9 +13,9 @@ from logging import basicConfig, getLogger, DEBUG, INFO, WARNING, ERROR
 
 
 try:
-	seat_arg = [_arg.startswith('seat') for _arg in sys.argv].index(True)
+	option_args_n = [_arg.startswith('--') for _arg in sys.argv[1:]].index(False) + 1
 except ValueError:
-	seat_arg = len(sys.argv)
+	option_args_n = len(sys.argv)
 
 
 loglevels = {'debug':DEBUG, 'infos':INFO, 'warnings':WARNING, 'errors':ERROR, 'silent':ERROR + 1}
@@ -25,10 +25,10 @@ gwayco_loglevel = INFO
 wlroots_loglevel = WARNING
 
 for keyword, level in loglevels.items():
-	if '--gwayco-' + keyword in sys.argv[:seat_arg]:
+	if '--gwayco-' + keyword in sys.argv[:option_args_n]:
 		gwayco_loglevel = level
 	
-	if '--wlroots-' + keyword in sys.argv[:seat_arg]:
+	if '--wlroots-' + keyword in sys.argv[:option_args_n]:
 		wlroots_loglevel = level
 
 
@@ -400,7 +400,7 @@ class Server:
 				if object_name in ['foreign_manager']: # Those managers cause problems.
 					continue
 				object_ = getattr(self, object_name)
-
+				
 				for event_name in dir(object_):
 					if not event_name.endswith('_event'): continue
 					
@@ -474,8 +474,7 @@ class Server:
 		del self.scene_tree # Must be deleted before self.scene.
 		
 		for attr in reversed(self.__wl_objects):
-			if attr in {'backend', 'display', 'event_loop'}: # Deleting one of those object causes segfault (sometimes contingent on existence of event handler).
-				continue
+			if attr == 'event_loop': continue
 			
 			try:
 				if hasattr(self, attr):
@@ -540,7 +539,7 @@ class Server:
 		keymap = self.xkb_context.keymap_new_from_names()
 		self.log.debug(f" keyboard {keyboard.base.name} {keymap.layout_get_name(0)}")
 		keyboard.set_keymap(keymap)
-		keyboard.set_repeat_info(25, 600)
+		keyboard.set_repeat_info(25, 350)
 		
 		if not (self.capabilities & WlSeat.capability.keyboard):
 			self.capabilities |= WlSeat.capability.keyboard
@@ -749,6 +748,7 @@ class Server:
 		
 		# TODO: remap all surfaces to another output
 		output_device = self.outputs[addr(output_device_ptr)]
+		if not hasattr(self, 'output_layout'): return
 		self.output_layout.remove(output_device)
 		
 		background = self.output_scene[addr(output_device_ptr)]
@@ -787,29 +787,9 @@ class Server:
 		else:
 			raise ValueError
 	
-	#def xdg_shell_surface_configure_event(self, event):
-	#	"Surface configure event. The event interface doesn't provide access to configuration data. A series of more specific events will be sent instead, with actual parsed data."
-	#	self.log.debug(f"xdg_shell_surface_configure_event {event._ptr}")
-	#	xdg_surface = event.surface
-	#	if xdg_surface.role == XdgSurfaceRole.TOPLEVEL:
-	#		toplevel = self.toplevels[addr(xdg_surface)]
-	#	elif xdg_surface.role == XdgSurfaceRole.POPUP:
-	#		popup = self.popups[addr(xdg_surface)]
-	#	else:
-	#		raise ValueError
-	
-	#def xdg_shell_surface_ack_configure_event(self, event):
-	#	self.log.debug("xdg_shell_surface_ack_configure_event")
-	#	xdg_surface = event.surface
-	#	if xdg_surface.role == XdgSurfaceRole.TOPLEVEL:
-	#		toplevel = self.toplevels[addr(xdg_surface)]
-	#	elif xdg_surface.role == XdgSurfaceRole.POPUP:
-	#		popup = self.popups[addr(xdg_surface)]
-	#	else:
-	#		raise ValueError
-	
 	def xdg_shell_surface_destroy_event(self, null, creation_object=None):
 		"This event is called when any XdgSurface is destroyed. The argument is always a null pointer apparently."
+		
 		xdg_surface = creation_object
 		self.log.debug("Destroy xdg surface {hex(addr(xdg_surface))}")
 		
@@ -819,9 +799,6 @@ class Server:
 			del self.popups[addr(xdg_surface)]
 		else:
 			raise ValueError
-	
-	#def xdg_shell_surface_new_popup_event(self, event):
-	#	print("xdg_shell_surface_new_popup_event", dir(event))
 	
 	def new_toplevel_surface_event(self, xdg_surface):
 		"New toplevel window."
@@ -857,10 +834,6 @@ class Server:
 		for output in self.outputs.values():
 			output.commit()
 	
-	#def toplevel_surface_commit_event(self, xdg_surface_ptr, xdg_surface):
-	#	if addr(xdg_surface) not in self.toplevels: return # The surface had been destroyed before this event arrived.
-	#	self.log.info(f"Commit: {xdg_surface.toplevel.app_id}")
-	
 	def toplevel_surface_destroy_event(self, null, xdg_surface, creation_object=None):
 		"Destroy toplevel window."
 		self.log.info(f"Destroy toplevel surface: {hex(addr(xdg_surface))}")
@@ -891,7 +864,7 @@ class Server:
 	def decoration_manager_new_toplevel_decoration_event(self, decoration:XdgToplevelDecorationV1):
 		"Per-window decoration manager."
 		self.log.debug("Disable client-side window decorations.")
-		decoration.set_mode(XdgToplevelDecorationV1Mode.SERVER_SIDE)
+		decoration.set_mode(XdgToplevelDecorationV1Mode.SERVER_SIDE) # Disable client-side decorations for the newly created window that supports this protocol.
 	
 	def destroy_event(self, backend_ptr):
 		"Server destroy event; the last to be called."
@@ -903,6 +876,7 @@ class Server:
 	
 	def close(self):
 		"Gracefully close the server. This function should be overrided to kill the session."
+		print(type(self.xdg_shell.new_surface_event))
 		self.display.terminate()
 	
 	def pointed(self):
@@ -980,13 +954,24 @@ if __name__ == '__main__':
 	import os, signal
 	from subprocess import Popen, PIPE, TimeoutExpired
 	
-	if len(sys.argv) < seat_arg + 2:
-		logger.error(f"Usage: {sys.argv[0]} [--gwayco-LOGLEVEL] [--wlroots-LOGLEVEL] seat<N> <desktop command> <args ...>")
+	if len(sys.argv) < option_args_n + 1:
+		logger.error(f"Usage: {sys.argv[0]} [--gwayco-LOGLEVEL] [--wlroots-LOGLEVEL] <session command> <args ...>")
 		logger.error( "       LOGLEVEL = debug | infos | warnings | errors | silent")
+		
+		if __debug__:
+			logger.info("")
+			logger.info(f"Try: {sys.argv[0]} ./hello.py hello, void")
+			logger.info(f"     {sys.argv[0]} ./kittens.py")
+			logger.info(f"     {sys.argv[0]} ./gwayco-session.py")
 		exit(1)
 	
-	seat_id = sys.argv[seat_arg]
-	session_cmd = sys.argv[seat_arg + 1:]
+	try:
+		seat_id = os.environ['XDG_SEAT']
+	except KeyError:
+		logger.error("Export XDG_SEAT environment variable, i.e. 'seat0'.")
+		exit(1)
+	
+	session_cmd = sys.argv[option_args_n:]
 	
 	with Server(log=logger, cursor_size=24, seat_id=seat_id, nested=True) as server:
 		server.event_loop.add_signal(signal.SIGINT, lambda signum, _: server.close()) # Close on SIGTERM.
@@ -1013,7 +998,7 @@ if __name__ == '__main__':
 		
 		server.log.info("Finishing session")
 		try:
-			session.wait(timeout=2) # Collect the session process result.
+			session.wait(timeout=3) # Collect the session process result.
 		except TimeoutExpired:
 			logger.error("Timeout waiting for session to exit.")
 			session.kill() # Kill the session if it didn't die soon enough.

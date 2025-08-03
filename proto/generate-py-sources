@@ -1,0 +1,266 @@
+#!/usr/bin/python3
+
+
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+
+def parse_xml(xml_file):
+	tree = ET.parse(xml_file)
+	root = tree.getroot()
+	interfaces = root.findall('interface')
+	return interfaces
+
+
+python_reserved_words = {'id'}
+
+
+def camel_case(name):
+	return ''.join(_part.capitalize() for _part in name.split('_'))
+
+
+def convert_type(type_):
+	match type_:
+		case 'int':
+			return 'int32_t'
+		case 'uint':
+			return 'uint32_t'
+		case 'string':
+			return 'const char *'
+		case 'new_id':
+			return 'uint32_t'
+		case 'object':
+			return 'struct wl_resource *'
+		case _:
+			raise ValueError(f"Unsupported type: {type_}")
+
+
+def generate_client(protocol, interfaces, fd):
+	fd.write(f"# cython: language_level=3\n")
+	fd.write(f"# distutils: include_dirs = .\n")
+	fd.write(f"# distutils: sources = {protocol}.c\n")
+	fd.write(f"# distutils: libraries = wayland-client\n")
+	fd.write(f"\n")
+	fd.write(f"\n")
+	fd.write(f"cdef extern from \"{protocol}_client.h\":\n")
+	fd.write(f"	pass\n")
+	fd.write(f"\n")
+	fd.write(f"\n")
+	fd.write(f"cdef extern from \"{protocol}_enum.h\":\n")
+	fd.write(f"	pass\n")
+	fd.write(f"\n")
+	fd.write(f"\n")
+	
+	for interface in interfaces:
+		interface_name = interface.get('name')
+		
+		fd.write(f"cdef class _{interface_name}:\n")
+		fd.write(f"	def __cinit__(self, display):\n")
+		fd.write(f"		self.__proxy = {interface_name}(display)\n")
+		fd.write(f"		self.__listener = {interface_name}_listener()\n")
+		for event in interface.findall('event'):
+			event_name = event.get('name')
+		fd.write(f"		self.__listener.{event_name} = self.__{event_name}\n")
+		fd.write(f"		{interface_name}_add_listener(self.__proxy, self.__listener, None)\n")
+		fd.write(f"\n")
+		
+		for request in interface.findall('request'):
+			request_name = request.get('name')
+			fd.write(f"	def {request_name}(self")
+			args = []
+			for arg in request.findall('arg'):
+				arg_name = arg.get('name')
+				arg_type = arg.get('type')
+				fd.write(f", {arg_type} {arg_name}")
+				args.append(arg_name)
+			fd.write("):\n")
+			fd.write(f"		return {interface_name}_{request_name}(self.__proxy" + (", " if args else "") + ", ".join(args) + ")\n")
+			fd.write(f"\n")
+
+		for event in interface.findall('event'):
+			event_name = event.get('name')
+			fd.write(f"	def __{event_name}(self")
+			args = []
+			for arg in event.findall('arg'):
+				arg_name = mangle_name(arg.get('name'))
+				arg_type = arg.get('type')
+				fd.write(f", {arg_type} {arg_name}")
+				args.append(arg_name)
+			fd.write("):\n")
+			fd.write(f"		return self._emit('{event_name}'" + (", " if args else "") + ", ".join(args) + ")\n")
+			fd.write(f"\n")
+		
+		fd.write(f"\n")
+
+
+
+def generate_server(protocol, interfaces, fd):
+	fd.write(f"#!/usr/bin/python3\n")
+	fd.write(f"\n")
+	fd.write(f"\n")
+	fd.write("from pywayland.server.listener import Signal\n")
+	fd.write("from cffi import FFI\n")
+	fd.write(f"\n")
+	fd.write(f"\n")
+	fd.write(f"ffi = FFI()\n\n")
+	
+	fd.write("ffi.cdef(\"struct wl_client;\")\n")
+	fd.write("ffi.cdef(\"struct wl_resource;\")\n")
+	fd.write("ffi.cdef(\"struct wl_interface;\")\n\n")
+	
+	fd.write(f"protocol = ffi.dlopen('./{protocol}.so')\n\n\n")
+	
+	for interface in interfaces:
+		interface_name = interface.attrib['name']
+		interface_version = interface.attrib['version']
+		
+		fd.write(f"{interface_name}_interface_version = {interface_version}\n\n")
+		
+		fd.write("ffi.cdef(\"\"\"\n")
+		fd.write(f"struct {interface_name}_interface {{\n")
+		
+		for request in interface.findall('request'):
+			request_name = request.attrib['name']
+			
+			fd.write(f"	void (*{request_name})(struct wl_client*, struct wl_resource*")
+			for arg in request.findall('arg'):
+				arg_type = convert_type(arg.attrib['type'])
+				fd.write(f", {arg_type}")
+			fd.write(");\n")
+		
+		fd.write("};\n")
+		fd.write("\"\"\")\n")
+		
+		fd.write(f"ffi.cdef(\"const struct wl_interface* get_{interface_name}_interface();\")\n\n")
+	
+		fd.write(f"{interface_name}_interface = protocol.get_{interface_name}_interface()\n\n\n")
+	
+	for interface in interfaces:
+		interface_name = interface.attrib['name']
+				
+		for request in interface.findall('request'):
+			request_name = request.attrib['name']
+			
+			fd.write(f"def {interface_name}_{request_name}_event(client, resource")
+			for arg in request.findall('arg'):
+				arg_name = 'arg_' + arg.attrib['name']
+				fd.write(f", {arg_name}")
+			fd.write("):\n")
+			
+			for n, arg in enumerate(request.findall('arg')):
+				if arg.attrib['type'] == 'new_id':
+					arg_name = 'arg_' + arg.attrib['name']
+					arg_iface = arg.attrib['interface']
+					fd.write(f"	new_resource = wl_resource_create(client, {arg_iface}_interface, {arg_iface}_interface_version, {arg_name})\n")
+					fd.write(f"	new_{arg_iface}_{n} = resources[new_resource] = {camel_case(arg_iface)}(new_resource)\n")
+			
+			fd.write(f"	{interface_name} = resources[resource]\n")
+			fd.write(f"	{interface_name}.{request_name}_event.emit(")
+			for n, arg in enumerate(request.findall('arg')):
+				if arg.attrib['type'] == 'new_id':
+					arg_name = 'new_' + arg.attrib['interface'] + '_' + str(n)
+				else:
+					arg_name = 'arg_' + arg.attrib['name']
+				if n:
+					fd.write(", ")
+				fd.write(arg_name)
+			
+			fd.write(f")\n")
+			
+			if request.get('type') == 'destructor':
+				fd.write("	del resources[resource]\n")
+			
+			fd.write("\n")
+			fd.write(f"{interface_name}_interface.{request_name} = {interface_name}_{request_name}_event\n")
+			fd.write("\n")
+			fd.write("\n")
+			
+	for interface in interfaces:
+		interface_name = interface.attrib['name']
+		
+		fd.write(f"class {camel_case(interface_name)}:\n")
+		fd.write(f"	def __init__(self, resource):\n")
+		for request in interface.findall('request'):
+			request_name = request.attrib['name']
+			fd.write(f"		self.{request_name}_event = Signal()\n")
+		fd.write(f"	\n")
+		
+		for event in interface.findall('event'):
+			event_name = event.attrib['name']
+			fd.write(f"	def {event_name}(self):\n")
+			fd.write(f"		pass\n")
+			fd.write(f"	\n")
+		
+		fd.write("\n")
+		
+
+
+
+
+
+
+
+
+'''
+	fd.write(f"\n")
+	fd.write(f"cdef extern from \"{protocol}_enum.h\":\n")
+	fd.write(f"	pass\n")
+	fd.write(f"\n")
+	fd.write(f"\n")
+	
+	for interface in interfaces:
+		interface_name = interface.get('name')
+		
+		fd.write(f"cdef class _{interface_name}:\n")
+		fd.write(f"	def __cinit__(self):\n")
+		fd.write(f"		self.__resource = {interface_name}()\n")
+		fd.write(f"		self.__interface = {interface_name}_interface()\n")
+		for request in interface.findall('request'):
+			request_name = request.get('name')
+			fd.write(f"		self.__interface.{request_name} = self.__{request_name}\n")
+		fd.write(f"\n")
+		
+		for request in interface.findall('request'):
+			request_name = request.get('name')
+			fd.write(f"	def __{request_name}(self, _client, _resource")
+			args = []
+			for arg in request.findall('arg'):
+				arg_name = mangle_name(arg.get('name'))
+				arg_type = arg.get('type')
+				fd.write(f", {arg_type} {arg_name}")
+				args.append(arg_name)
+			fd.write("):\n")
+			fd.write(f"		return self.emit('{request_name}'" + (", " if args else "") + ", ".join(args) + ")\n")
+			fd.write(f"\n")
+		
+		for event in interface.findall('event'):
+			event_name = event.get('name')
+			fd.write(f"	def {event_name}(self")
+			args = []
+			for arg in event.findall('arg'):
+				arg_name = mangle_name(arg.get('name'))
+				arg_type = arg.get('type')
+				fd.write(f", {arg_type} {arg_name}")
+				args.append(arg_name)
+			fd.write("):\n")
+			fd.write(f"		return {interface_name}_send_{event_name}(self.__resource" + (", " if args else "") + ", ".join(args) + ")\n")
+			fd.write(f"\n")
+'''
+
+
+if __name__ == '__main__':
+	from sys import argv
+	
+	match argv[1]:
+		case 'server':
+			basename = argv[2]
+			interfaces = parse_xml(basename + '.xml')
+			server_path = Path(basename + '_server.py')
+			with server_path.open('w') as fd:
+				generate_server(basename, interfaces, fd)
+			server_path.chmod(0o111 | server_path.stat().st_mode)
+		
+		case _:
+			raise ValueError
+
+
